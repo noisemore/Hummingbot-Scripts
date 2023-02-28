@@ -1,0 +1,539 @@
+from decimal import Decimal
+from typing import Dict
+
+import pandas as pd
+import pandas_ta as ta  # noqa: F401
+from hummingbot.connector.connector_base import ConnectorBase
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+
+from hummingbot.core.data_type.common import PositionAction
+from hummingbot.core.event.events import OrderType
+from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory
+from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+
+
+# ---------------------------------------------------------------------------------------------------#
+
+def interval_in_sec(_interval):
+    data_interval = int(60)
+    if str("m") in _interval:
+        data_interval = _interval.replace(str("m"), str(""))
+        data_interval = int(data_interval)
+        data_interval = int(data_interval * 60)
+    elif "h" in _interval:
+        data_interval = _interval.replace(str("h"), str(""))
+        data_interval = int(data_interval)
+        data_interval = int(data_interval * 60 * 60)
+    elif "d" in _interval:
+        data_interval = _interval.replace(str("d"), str(""))
+        data_interval = int(data_interval)
+        data_interval = int(data_interval * 60 * 60 * 24)
+    elif "w" in _interval:
+        data_interval = _interval.replace(str("w"), str(""))
+        data_interval = int(data_interval)
+        data_interval = int(data_interval * 60 * 60 * 24 * 7)
+    return data_interval
+
+
+# ---------------------------------------------------------------------------------------------------#
+
+class perpetual_price_prediction_market_making(ScriptStrategyBase):
+    """
+    A simple trading strategy that uses RSI in one timeframe to determine whether to go long or short.
+    IMPORTANT: Binance perpetual has to be in Single Asset Mode, soon we are going to support Multi Asset Mode.
+    """
+    # Define the trading pair and exchange that we want to use and the csv where we are going to store the entries
+    exchange = str("binance_perpetual_testnet")
+    data_connector = str("binance_perpetuals")
+    trading_pair = str("BNB-USDT")
+    have_data = bool(False)
+
+    # The markets are the connectors that you can use to execute all the methods of the scripts strategy base
+    # The candlesticks are just a component that provides the information of the candlesticks
+    markets = {exchange: {trading_pair}}
+
+    # Configure the leverage and order amount the bot is going to use
+    leverage = 2
+    budget = Decimal("100")
+    order_amount_usd = Decimal("100")
+
+    # Set the trend interval for the candles that we are going to use
+    trend_interval = str("4h")
+    # Create the candles that we want to use and the thresholds for the indicators
+    _trend_candles = CandlesFactory.get_candle(connector=data_connector,
+                                               trading_pair=trading_pair,
+                                               interval=trend_interval,
+                                               max_records=60)
+    # Set SuperTrend config
+    _length = int(6)
+    _multiplier = float(2.618)
+    _action_signal = "No Action"
+    _last_trend = bool(True)
+    trend_candles_df = pd.DataFrame()
+
+    # Set the indicator interval for the candles that we are going to use
+    analysis_interval = str("1m")
+    # Create the candles that we want to use and the thresholds for the indicators
+    _analysis_candles = CandlesFactory.get_candle(connector=data_connector,
+                                                  trading_pair=trading_pair,
+                                                  interval=analysis_interval,
+                                                  max_records=60)
+
+    # Set price prediction config
+    mom_len = int(10)
+    mfi_len = int(14)
+    atr_len = int(14)
+    atr_prediction = Decimal("0.00")
+    analysis_candles_df = pd.DataFrame()
+    order_atr_multiplier = Decimal("1.618")
+
+    # Set position info interval show on log
+    position_info_interval = str("1m")
+
+    # Set position info variables
+    _market_pair = str("")
+    _position_side = str("")
+    _unrealized_pnl = float(0)
+    _entry_price = Decimal("0.00")
+    _amount = Decimal('0.00')
+    _leverage = int(0)
+
+    # Initialize timestamp and order time
+    last_ordered_ts = int(0)
+    order_interval = int(1)
+
+    # ---------------------------------------------------------------------------------------------------#
+
+    def __init__(self, connectors: Dict[str, ConnectorBase]):
+        # Is necessary to start the Candles Feed.
+        super().__init__(connectors)
+        self._trend_candles.start()
+        self._analysis_candles.start()
+
+    # ---------------------------------------------------------------------------------------------------#
+
+    @property
+    def all_candles_ready(self):
+        """
+        Checks if the candlesticks are full.
+        :return:
+        """
+        return all([self._trend_candles.is_ready, self._analysis_candles.is_ready])
+
+    # ---------------------------------------------------------------------------------------------------#
+
+    def on_tick(self):
+        # Get position info
+        self._market_pair, self._position_side, self._unrealized_pnl, self._entry_price, self._amount, self._leverage = self.get_position_info(
+            self.trading_pair)
+
+        # Get initial trend data
+        if self.have_data is False:
+            # Print position info in log
+            self.logger().info(f"Market Pair: {self._market_pair}, "
+                               f"Position Side: {self._position_side}, "
+                               f"Unrealized PnL: {self._unrealized_pnl}, "
+                               f"Entry Price: {self._entry_price}, "
+                               f"Amount: {self._amount}, "
+                               f"Leverage: {self._leverage}")
+            self.trend_candles_df, self._last_trend, self._action_signal = self.get_action_signal(self._trend_candles,
+                                                                                                  self._length,
+                                                                                                  self._multiplier)
+            # Print self._action_signal in log
+            self.logger().info(f"Current Signal: {self._action_signal}")
+            # If we have trend data and new signal, then cancel all orders and close all positions and open new position
+            if self._action_signal == "Long" and self._position_side == "Short" and self.is_margin_enough(
+                    self.trading_pair, self.budget, self.leverage) is True:
+                self.cancel_all_orders()
+                self.close_open_positions(self._market_pair, self._amount)
+                self.market_buy(self.trading_pair, self.budget, self.leverage)
+            elif self._action_signal == "Long" and self._position_side == "No Position" and self.is_margin_enough(
+                    self.trading_pair, self.budget, self.leverage) is True:
+                self.cancel_all_orders()
+                self.market_buy(self.trading_pair, self.budget, self.leverage)
+            elif self._action_signal == "Short" and self._position_side == "Long" and self.is_margin_enough(
+                    self.trading_pair, self.budget, self.leverage) is True:
+                self.cancel_all_orders()
+                self.close_open_positions(self._market_pair, self._amount)
+                self.market_sell(self.trading_pair, self.budget, self.leverage)
+            elif self._action_signal == "Short" and self._position_side == "No Position" and self.is_margin_enough(
+                    self.trading_pair, self.budget, self.leverage) is True:
+                self.cancel_all_orders()
+                self.market_sell(self.trading_pair, self.budget, self.leverage)
+
+            if self._last_trend is not None:
+                self.analysis_candles_df, self.atr_prediction = self._atr_prediction(self._analysis_candles)
+                self.cancel_all_orders()
+                self.maker_buy(self.trading_pair)
+                self.maker_sell(self.trading_pair)
+
+            self.have_data = True
+            self.last_ordered_ts = self.current_timestamp
+
+        # If we have trend data and new signal, then cancel all orders and close all positions and open new position
+        elif self.have_data is True:
+            if self.current_timestamp == (
+                    (self.current_timestamp //
+                     interval_in_sec(self.trend_interval)) *
+                    interval_in_sec(self.trend_interval)):
+                self.trend_candles_df, self._last_trend, self._action_signal = self.get_action_signal(
+                    self._trend_candles, self._length, self._multiplier)
+                # Print position info in log
+                self.logger().info(f"Market Pair: {self._market_pair}, "
+                                   f"Position Side: {self._position_side}, "
+                                   f"Unrealized PnL: {self._unrealized_pnl}, "
+                                   f"Entry Price: {self._entry_price}, "
+                                   f"Amount: {self._amount}, "
+                                   f"Leverage: {self._leverage}")
+                # Print self._action_signal in log
+                self.logger().info(f"Current Signal: {self._action_signal}")
+                # If we get signal, close position and open new position
+                if self._action_signal == "Long" and self._position_side == "Short" and self.is_margin_enough(
+                        self.trading_pair, self.budget, self.leverage) is True:
+                    self.cancel_all_orders()
+                    self.close_open_positions(self._market_pair, self._amount)
+                    self.market_buy(self.trading_pair, self.budget, self.leverage)
+                elif self._action_signal == "Long" and self._position_side == "No Position" and self.is_margin_enough(
+                        self.trading_pair, self.budget, self.leverage) is True:
+                    self.cancel_all_orders()
+                    self.market_buy(self.trading_pair, self.budget, self.leverage)
+                elif self._action_signal == "Short" and self._position_side == "Long" and self.is_margin_enough(
+                        self.trading_pair, self.budget, self.leverage) is True:
+                    self.cancel_all_orders()
+                    self.close_open_positions(self._market_pair, self._amount)
+                    self.market_sell(self.trading_pair, self.budget, self.leverage)
+                elif self._action_signal == "Short" and self._position_side == "No Position" and self.is_margin_enough(
+                        self.trading_pair, self.budget, self.leverage) is True:
+                    self.cancel_all_orders()
+                    self.market_sell(self.trading_pair, self.budget, self.leverage)
+
+            if self.current_timestamp == (
+                    (self.current_timestamp //
+                     interval_in_sec(self.analysis_interval)) *
+                    interval_in_sec(self.analysis_interval)) and self._last_trend is not None:
+                self.analysis_candles_df, self.atr_prediction = self._atr_prediction(self._analysis_candles)
+                self.logger().info(f"ATR Prediction: {self.atr_prediction}")
+
+            if self.last_ordered_ts < (self.current_timestamp - self.order_interval):
+                self.cancel_all_orders()
+                self.maker_buy(self.trading_pair)
+                self.maker_sell(self.trading_pair)
+                self.last_ordered_ts = self.current_timestamp
+
+    # ---------------------------------------------------------------------------------------------------#
+    def get_action_signal(self, _trend_candles, _length, _multiplier):
+        # Input candles
+        trend_candles_df = _trend_candles.candles_df
+        trend_candles_df.drop(axis=1,
+                              columns={
+                                  'quote_asset_volume',
+                                  'n_trades',
+                                  'taker_buy_base_volume',
+                                  'taker_buy_quote_volume'},
+                              inplace=True)
+        # Let's add some technical indicators
+        _props = f"_{_length}_{self._multiplier}"
+        trend_candles_df.ta.supertrend(length=_length, multiplier=_multiplier, append=True)
+        trend_candles_df.drop(axis=1,
+                              columns={f'SUPERT{_props}',
+                                       f'SUPERTl{_props}',
+                                       f'SUPERTs{_props}'},
+                              inplace=True)
+        trend_candles_df = trend_candles_df.rename({f'SUPERTd{_props}': 'uptrend'}, axis='columns')
+        trend_candles_df = trend_candles_df.replace({1: True, -1: False})
+        trend_candles_df["timestamp"] = pd.to_datetime(trend_candles_df["timestamp"], unit="ms")
+        pre_trend = bool(trend_candles_df.iloc[-2]['uptrend'])
+        last_trend = bool(trend_candles_df.iloc[-1]['uptrend'])
+        if last_trend is True and pre_trend is False:
+            _action_signal = str("Long")
+        elif last_trend is False and pre_trend is True:
+            _action_signal = str("Short")
+        else:
+            _action_signal = str("No Action")
+        return trend_candles_df, last_trend, _action_signal
+
+    def _atr_prediction(self, _analysis_candles):
+        # Input candles
+        analysis_candles_df = _analysis_candles.candles_df.copy()
+        analysis_candles_df.drop(axis=1,
+                                 columns={
+                                     'quote_asset_volume',
+                                     'n_trades',
+                                     'taker_buy_base_volume',
+                                     'taker_buy_quote_volume'},
+                                 inplace=True)
+        # Calculate Trading Volume, HLC3, and True Range Indicators
+        analysis_candles_df['tr'] = analysis_candles_df.ta.true_range(inplace=True)
+        analysis_candles_df['mom'] = analysis_candles_df.ta.mom(length=self.mom_len, inplace=True)
+        analysis_candles_df['mfi'] = analysis_candles_df.ta.mfi(length=self.mfi_len, inplace=True)
+        analysis_candles_df['atr'] = analysis_candles_df.ta.atr(length=self.atr_len, inplace=True)
+
+        # Shift the data in the High and Low columns.
+        analysis_candles_df['atr_1'] = analysis_candles_df['atr'].shift(1)
+        analysis_candles_df.dropna(inplace=True)
+
+        # Define the feature and target variables.
+        features = analysis_candles_df[['volume', 'high', 'low', 'close', 'tr', 'mom', 'mfi']]
+        target = analysis_candles_df['atr_1']
+
+        features_train, features_test, target_train, target_test = train_test_split(features, target,
+                                                                                    test_size=0.382, random_state=0)
+
+        # Create a linear regression model and train it.
+        lr = LinearRegression()
+        lr.fit(features_train, target_train)
+
+        # Make predictions on the test set.
+        target_pred = lr.predict(features_test)
+
+        # Calculate the root mean squared error (RMSE).
+        # mse = mean_squared_error(targets_test, targets_pred)
+        # rmse = mse ** 0.5
+
+        analysis_candles_df.drop(axis=1,
+                                 columns={'tr', 'mom', 'mfi', 'atr_1'}, inplace=True)
+        features = features.dropna()
+        analysis_candles_df['target_pred'] = lr.predict(features)
+        analysis_candles_df["timestamp"] = pd.to_datetime(analysis_candles_df["timestamp"], unit="ms")
+        atr_pred = Decimal(str(analysis_candles_df['target_pred'].iloc[-1]))
+
+        return analysis_candles_df, atr_pred
+
+    def market_buy(self, _trading_pair, _budget, _leverage):
+        # Set leverage
+        self.connectors[self.exchange].set_leverage(_trading_pair, _leverage)
+        self.buy(connector_name=self.exchange,
+                 trading_pair=_trading_pair,
+                 amount=_budget / self.connectors[self.exchange].get_mid_price(_trading_pair),
+                 order_type=OrderType.MARKET,
+                 price=self.connectors[self.exchange].get_mid_price(_trading_pair),
+                 position_action=PositionAction.OPEN)
+
+    def market_sell(self, _trading_pair, _budget, _leverage):
+        # Set leverage
+        self.connectors[self.exchange].set_leverage(_trading_pair, _leverage)
+        self.sell(connector_name=self.exchange,
+                  trading_pair=_trading_pair,
+                  amount=_budget / self.connectors[self.exchange].get_mid_price(_trading_pair),
+                  order_type=OrderType.MARKET,
+                  price=self.connectors[self.exchange].get_mid_price(_trading_pair),
+                  position_action=PositionAction.OPEN)
+
+    def maker_buy(self, _trading_pair):
+        if self._last_trend is True:
+            self.buy(connector_name=self.exchange,
+                     trading_pair=_trading_pair,
+                     amount=self.order_amount_usd / self.connectors[self.exchange].get_mid_price(_trading_pair),
+                     order_type=OrderType.LIMIT,
+                     price=self.connectors[self.exchange].get_mid_price(_trading_pair) - (
+                             self.atr_prediction * self.order_atr_multiplier),
+                     position_action=PositionAction.OPEN)
+        elif self._last_trend is False and abs(self._amount) > self.order_amount_usd / self.connectors[self.exchange].get_mid_price(_trading_pair):
+            self.buy(connector_name=self.exchange,
+                     trading_pair=_trading_pair,
+                     amount=self.order_amount_usd / self.connectors[self.exchange].get_mid_price(_trading_pair),
+                     order_type=OrderType.LIMIT,
+                     price=self.connectors[self.exchange].get_mid_price(_trading_pair) - (
+                             self.atr_prediction * self.order_atr_multiplier),
+                     position_action=PositionAction.CLOSE)
+        elif self._last_trend is False and self.order_amount_usd / self.connectors[self.exchange].get_mid_price(
+                _trading_pair) > abs(self._amount) > Decimal('0.00'):
+            self.buy(connector_name=self.exchange,
+                     trading_pair=_trading_pair,
+                     amount=abs(self._amount),
+                     order_type=OrderType.LIMIT,
+                     price=self.connectors[self.exchange].get_mid_price(_trading_pair) - (
+                             self.atr_prediction * self.order_atr_multiplier),
+                     position_action=PositionAction.CLOSE)
+        elif self._last_trend is False and abs(self._amount) == Decimal('0.00'):
+            pass
+
+    def maker_sell(self, _trading_pair):
+        if self._last_trend is True and self._amount > self.order_amount_usd / self.connectors[self.exchange].get_mid_price(_trading_pair):
+            self.sell(connector_name=self.exchange,
+                      trading_pair=_trading_pair,
+                      amount=self.order_amount_usd / self.connectors[self.exchange].get_mid_price(_trading_pair),
+                      order_type=OrderType.LIMIT,
+                      price=self.connectors[self.exchange].get_mid_price(_trading_pair) + (
+                              self.atr_prediction * self.order_atr_multiplier),
+                      position_action=PositionAction.CLOSE)
+        elif self._last_trend is True and self.order_amount_usd / self.connectors[self.exchange].get_mid_price(
+                _trading_pair) > self._amount > Decimal('0.00'):
+            self.sell(connector_name=self.exchange,
+                      trading_pair=_trading_pair,
+                      amount=self._amount,
+                      order_type=OrderType.LIMIT,
+                      price=self.connectors[self.exchange].get_mid_price(_trading_pair) + (
+                              self.atr_prediction * self.order_atr_multiplier),
+                      position_action=PositionAction.CLOSE)
+        elif self._last_trend is True and self._amount == Decimal('0.00'):
+            pass
+        elif self._last_trend is False:
+            self.sell(connector_name=self.exchange,
+                      trading_pair=_trading_pair,
+                      amount=self.order_amount_usd / self.connectors[self.exchange].get_mid_price(_trading_pair),
+                      order_type=OrderType.LIMIT,
+                      price=self.connectors[self.exchange].get_mid_price(_trading_pair) + (
+                             self.atr_prediction * self.order_atr_multiplier),
+                      position_action=PositionAction.OPEN)
+
+    def close_open_positions(self, _market_pair, _amount):
+        # we are going to close all the open positions when the bot stops
+        if self._position_side == "Long":
+            self.sell(connector_name=self.exchange,
+                      trading_pair=_market_pair,
+                      amount=abs(_amount),
+                      order_type=OrderType.MARKET,
+                      price=self.connectors[self.exchange].get_mid_price(_market_pair),
+                      position_action=PositionAction.CLOSE)
+        elif self._position_side == "Short":
+            self.buy(connector_name=self.exchange,
+                     trading_pair=_market_pair,
+                     amount=abs(_amount),
+                     order_type=OrderType.MARKET,
+                     price=self.connectors[self.exchange].get_mid_price(_market_pair),
+                     position_action=PositionAction.CLOSE)
+        else:
+            pass
+
+    def get_position_info(self, _trading_pair):
+        market_pair = str("No Market Pair")
+        position_side = str("No Position")
+        unrealized_pnl = float(0.00)
+        entry_price = Decimal('0.00')
+        amount = Decimal('0.00')
+        leverage = int(self._leverage)
+        # Get position info
+        position_info = self.connectors[self.exchange]._perpetual_trading.account_positions
+        # Check if position_info is not empty
+        position_info_market = _trading_pair.replace("-", "")
+        if position_info_market in position_info and position_info[position_info_market].amount < 0:
+            market_pair = position_info[position_info_market].trading_pair
+            position_side = str("Short")
+            unrealized_pnl = position_info[position_info_market].unrealized_pnl
+            entry_price = position_info[position_info_market].entry_price
+            amount = Decimal(str(position_info[position_info_market].amount))
+            leverage = position_info[position_info_market].leverage
+            # Print position info in log
+            # self.logger().info(
+            #     f"Position info: "
+            #     f"Market: {position_info[position_info_market].trading_pair}, "
+            #     f"Position side: {position_side}, "
+            #     f"Unrealized PnL: {position_info[position_info_market].unrealized_pnl}, "
+            #     f"Entry Price: {position_info[position_info_market].entry_price},"
+            #     f"Amount: {position_info[position_info_market].amount}, "
+            #     f"Leverage: {position_info[position_info_market].leverage}"
+            # )
+        elif position_info_market in position_info and position_info[position_info_market].amount > 0:
+            market_pair = position_info[position_info_market].trading_pair
+            position_side = str("Long")
+            unrealized_pnl = position_info[position_info_market].unrealized_pnl
+            entry_price = position_info[position_info_market].entry_price
+            amount = Decimal(str(position_info[position_info_market].amount))
+            leverage = position_info[position_info_market].leverage
+            # Print position info in log
+            # self.logger().info(
+            #     f"Position info: "
+            #     f"Market: {position_info[position_info_market].trading_pair}, "
+            #     f"Position side: {position_side}, "
+            #     f"Unrealized PnL: {position_info[position_info_market].unrealized_pnl}, "
+            #     f"Entry Price: {position_info[position_info_market].entry_price},"
+            #     f"Amount: {position_info[position_info_market].amount}, "
+            #     f"Leverage: {position_info[position_info_market].leverage}"
+            # )
+        else:
+            market_pair = market_pair
+            position_side = position_side
+            unrealized_pnl = unrealized_pnl
+            entry_price = entry_price
+            amount = amount
+            leverage = leverage
+
+        return market_pair, position_side, unrealized_pnl, entry_price, amount, leverage
+
+    def cancel_all_orders(self):
+        """
+        Cancel all orders from the bot
+        """
+        for order in self.get_active_orders(connector_name=self.exchange):
+            self.cancel(self.exchange, order.trading_pair, order.client_order_id)
+
+    def is_margin_enough(self, _trading_pair, _budget, _leverage):
+        quote_balance = self.connectors[self.exchange].get_available_balance(_trading_pair.split("-")[-1])
+        if _budget < quote_balance * _leverage:
+            return True
+        else:
+            self.logger().info("No enough margin to place orders.")
+            return False
+
+    def on_stop(self):
+        """
+        Without this functionality, the network iterator will continue running forever after stopping the strategy
+        That's why is necessary to introduce this new feature to make a custom stop with the strategy.
+        :return:
+        """
+        # self.close_open_positions
+        self._analysis_candles.stop()
+        self._trend_candles.stop()
+
+    def format_status(self) -> str:
+        """
+        Displays the three candlesticks involved in the script with Current Trend.
+        """
+        if not self.ready_to_trade:
+            return "Market connectors are not ready."
+        lines = []
+        if self.all_candles_ready:
+            lines.extend([
+                "\n########################################### Market Data ############################################\n"])
+            position_info = {"Market Pair": self._market_pair,
+                             "Position Side": self._position_side,
+                             "Unrealized PnL": self._unrealized_pnl,
+                             "Entry Price": self._entry_price,
+                             "Amount": self._amount,
+                             "Leverage": self._leverage}
+            position_info_df = pd.DataFrame.from_dict(position_info, orient='index').T
+            real_time_candles = self._analysis_candles.candles_df.tail(1).copy()
+            real_time_candles.drop(axis=1,
+                                   columns={
+                                       'quote_asset_volume',
+                                       'n_trades',
+                                       'taker_buy_base_volume',
+                                       'taker_buy_quote_volume'},
+                                   inplace=True)
+            real_time_candles["timestamp"] = pd.to_datetime(real_time_candles["timestamp"], unit="ms")
+            lines.extend([f"Exchange: {self.exchange}\n"])
+            lines.extend([f"Position Info:"])
+            lines.extend(["" + line for line in position_info_df.to_string(index=False).split("\n")])
+            lines.extend([
+                "\n----------------------------------------------------------------------------------------------------\n"])
+            lines.extend([f"Real time data: | Action Signal: {self._action_signal}\n"])
+            lines.extend(["" + line for line in real_time_candles.to_string(index=False).split("\n")])
+            try:
+                orders_df = self.active_orders_df().drop(axis=1, columns={"Exchange"})
+                # buy_diff = abs(orders_df.loc[orders_df['Side'] == 'buy', 'Price'].item() - real_time_candles['close'].item())
+                # sell_diff = abs(orders_df.loc[orders_df['Side'] == 'sell', 'Price'].item() - real_time_candles['close'].item())
+                # orders_df['price diff'] = None
+                # orders_df.loc[orders_df['Side'] == 'buy', 'price diff'] = buy_diff
+                # orders_df.loc[orders_df['Side'] == 'sell', 'price diff'] = sell_diff
+                lines.extend(
+                    ["", "Active Orders:"] + ["" + line for line in orders_df.to_string(index=False).split("\n")])
+            except ValueError:
+                lines.extend(["", "No active maker orders."])
+            lines.extend([
+                "\n----------------------------------------------------------------------------------------------------\n"])
+            lines.extend([f"Current Trend: {self._last_trend}\n"])
+            lines.extend([f"Candles: {self.trading_pair} | Interval: {self.trend_interval}"])
+            lines.extend(["" + line for line in self.trend_candles_df.tail(5).to_string(index=False).split("\n")])
+            lines.extend([
+                "\n----------------------------------------------------------------------------------------------------\n"])
+
+            lines.extend([f"Predict ATR: {self.atr_prediction}\n"])
+            lines.extend([f"Candles: {self.trading_pair} | Interval: {self.analysis_interval}"])
+            lines.extend(["" + line for line in self.analysis_candles_df.tail(5).to_string(index=False).split("\n")])
+            lines.extend([""])
+        else:
+            lines.extend(["", "  No data collected."])
+
+        return "\n".join(lines)
