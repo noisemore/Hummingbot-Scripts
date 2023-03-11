@@ -91,8 +91,8 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
     analysis_candles_df = pd.DataFrame()
 
     # Set build inventory config
-    # build_ordered_ts = int(0)
-    # build_interval = int(10)
+    build_ordered_ts = int(0)
+    build_interval = int(10)
 
     # Set order config
     # last_ordered_ts = int(0)
@@ -140,12 +140,10 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
                 self.have_data = True
             else:
                 if self.current_timestamp == (
-                        (self.current_timestamp // interval_in_sec(self.trend_interval)) * interval_in_sec(
-                    self.trend_interval)):
+                        (self.current_timestamp // interval_in_sec(self.trend_interval)) * interval_in_sec(self.trend_interval)):
                     self.trend_candles_df, self.last_trend, self.action_signal = self.get_trend_signal()
                 if self.current_timestamp == (
-                        (self.current_timestamp // interval_in_sec(self.analysis_interval)) * interval_in_sec(
-                    self.analysis_interval)):
+                        (self.current_timestamp // interval_in_sec(self.analysis_interval)) * interval_in_sec(self.analysis_interval)):
                     self.analysis_candles_df, self.atr_prediction = self.get_atr_prediction()
 
             # ========================================== Technical Analysis End ===========================================#
@@ -165,33 +163,37 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
                     )
                     self.run_the_bot = False
             else:
-                buy_atr_multiplier = self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier
-                sell_atr_multiplier = self.u_sell_atr_multiplier if self.last_trend else self.d_sell_atr_multiplier
+                if self.get_have_inventory() is not True and self.build_ordered_ts < (self.current_timestamp - self.build_interval):
+                    self.build_inventory()
+                    self.build_ordered_ts = self.current_timestamp
+                else:
+                    buy_atr_multiplier = self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier
+                    sell_atr_multiplier = self.u_sell_atr_multiplier if self.last_trend else self.d_sell_atr_multiplier
 
-                if self.mid_price != self.current_price:
-                    self.cancel_all_orders()
+                    if self.mid_price != self.current_price:
+                        self.cancel_all_orders()
 
-                    buy_target_price = self.current_price - (self.atr_prediction * buy_atr_multiplier)
-                    sell_target_price = self.current_price + (self.atr_prediction * sell_atr_multiplier)
-                    buy_order_amount = self.buy_amount(buy_target_price)
-                    sell_order_amount = self.sell_amount()
+                        buy_target_price = self.current_price - (self.atr_prediction * buy_atr_multiplier)
+                        sell_target_price = self.current_price + (self.atr_prediction * sell_atr_multiplier)
+                        buy_order_amount = self.buy_amount(buy_target_price)
+                        sell_order_amount = self.sell_amount()
 
-                    self.buy(
-                        connector_name=self.connector_name,
-                        trading_pair=self.market_pair,
-                        amount=buy_order_amount,
-                        order_type=OrderType.LIMIT,
-                        price=buy_target_price
-                    )
-                    self.sell(
-                        connector_name=self.connector_name,
-                        trading_pair=self.market_pair,
-                        amount=sell_order_amount,
-                        order_type=OrderType.LIMIT,
-                        price=sell_target_price
-                    )
+                        self.buy(
+                            connector_name=self.connector_name,
+                            trading_pair=self.market_pair,
+                            amount=buy_order_amount,
+                            order_type=OrderType.LIMIT,
+                            price=buy_target_price
+                        )
+                        self.sell(
+                            connector_name=self.connector_name,
+                            trading_pair=self.market_pair,
+                            amount=sell_order_amount,
+                            order_type=OrderType.LIMIT,
+                            price=sell_target_price
+                        )
 
-                    self.mid_price = self.current_price
+                        self.mid_price = self.current_price
 
             # ========================================== Order Management End =============================================#
 
@@ -216,20 +218,17 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
             buy_amount = self.order_usd / buy_target_price
         elif self.min_order_size <= self.connectors[self.connector_name].get_balance(self.coin_quote) < Decimal(
                 self.order_usd):
-            buy_amount = self.connectors[self.connector_name].get_balance(self.coin_quote)
+            buy_amount = self.connectors[self.connector_name].get_balance(self.coin_quote) / buy_target_price
         else:
             buy_amount = Decimal('0.0')
 
         return buy_amount
 
     def sell_amount(self):
-        if Decimal(self.min_order_size) <= self.connectors[self.connector_name].get_balance(
-                self.coin_base) * self.current_price <= Decimal(self.order_usd):
+        if Decimal(self.min_order_size) <= self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price <= Decimal(self.order_usd):
             sell_order_amount = self.connectors[self.connector_name].get_balance(self.coin_base)
-        elif Decimal(self.order_usd) <= self.connectors[self.connector_name].get_balance(
-                self.coin_base) * self.current_price:
-            sell_order_amount = (self.connectors[self.connector_name].get_balance(self.coin_base) * self.get_price(
-                self.market_pair, False)) / self.order_usd
+        elif Decimal(self.order_usd) <= self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price:
+            sell_order_amount = self.order_usd / self.connectors[self.connector_name].get_price(self.market_pair, False)
         elif self.connectors[self.connector_name].get_balance(self.coin_quote) <= Decimal(self.order_usd):
             sell_order_amount = self.connectors[self.connector_name].get_balance(self.coin_base) / Decimal("2")
         else:
@@ -241,23 +240,22 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
         """
         Build inventory
         """
-        if self.have_inventory is False:
-            if (self.connectors[self.connector_name].get_balance(
-                    self.coin_base) * self.current_price) >= self.total_budget / Decimal("2"):
-                self.have_inventory = True
-                self.logger().info("Inventory already built!")
-            else:
-                if self.build_ordered_ts < (self.current_timestamp - self.build_interval):
-                    order_amount = self.order_usd / self.connectors[self.connector_name].get_price(self.market_pair,
-                                                                                                   True)
-                    self.logger().info("Building inventory...")
-                    self.cancel_all_orders()
-                    self.buy(connector_name=self.connector_name,
-                             trading_pair=self.market_pair,
-                             amount=order_amount,
-                             order_type=OrderType.LIMIT,
-                             price=self.connectors[self.connector_name].get_price(self.market_pair, True))
-                    self.build_ordered_ts = self.current_timestamp
+        if self.connectors[self.connector_name].get_balance(self.coin_base) <= Decimal("0.1"):
+            self.buy(
+                connector_name=self.connector_name,
+                trading_pair=self.market_pair,
+                amount=Decimal('50.0') / self.connectors[self.connector_name].get_price(self.market_pair, True),
+                order_type=OrderType.LIMIT,
+                price=self.connectors[self.connector_name].get_price(self.market_pair, True)
+            )
+        else:
+            self.buy(
+                connector_name=self.connector_name,
+                trading_pair=self.market_pair,
+                amount=(Decimal('50.0') - self.connectors[self.connector_name].get_balance(self.coin_quote)) / self.connectors[self.connector_name].get_price(self.market_pair, True),
+                order_type=OrderType.LIMIT,
+                price=self.connectors[self.connector_name].get_price(self.market_pair, True)
+            )
 
     def get_have_inventory(self):
         return bool(self.connectors[self.connector_name].get_balance(self.coin_base) > Decimal("0"))
