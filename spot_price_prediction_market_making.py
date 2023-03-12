@@ -28,6 +28,9 @@ from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 def interval_in_sec(_data_interval):
     data_interval = int(14400)  # 默認時間間隔為 4 小時，以秒為單位表示
+    if str("s") in _data_interval:  # 如果時間間隔包含 "s"，表示以秒為單位
+        data_interval = _data_interval.replace(str("s"), str(""))  # 去除 "s" 字符
+        data_interval = int(data_interval)  # 將字符串轉換為整數
     if str("m") in _data_interval:  # 如果時間間隔包含 "m"，表示以分鐘為單位
         data_interval = _data_interval.replace(str("m"), str(""))  # 去除 "m" 字符
         data_interval = int(data_interval)  # 將字符串轉換為整數
@@ -86,7 +89,7 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
     analysis_candles_df = pd.DataFrame()  # 儲存進行價格預測的K線數據
 
     build_ordered_ts = int(0)  # 最近一次建立庫存的時間戳
-    build_interval = int(10)  # 建立庫存的時間間隔
+    build_interval = str("30s")  # 建立庫存的時間間隔
     have_inventory = bool(False)  # 是否已經建立庫存
 
     mid_price = Decimal("0.00")  # 市場的中間價格
@@ -122,159 +125,100 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
 
     def on_tick(self):
 
-        if self.run_the_bot is True and self.all_candles_ready is True:
-            # 已蒐集到足夠的數據，可以開始進行策略運行
+        if self.run_the_bot is True:
+            if self.all_candles_ready is True:
+                # 已蒐集到足夠的數據，可以開始進行策略運行
+                # ========================================== Technical Analysis Start =========================================#
 
-            # ========================================== Technical Analysis Start =========================================#
-
-            # 獲取趨勢數據和 ATR 預測
-            if self.have_data is False:
-                self.trend_candles_df, self.last_trend, self.action_signal = self.get_trend_signal()
-                self.analysis_candles_df, self.atr_prediction = self.get_atr_prediction()
-                self.have_data = True
-            else:
-                # 根據指定的時間間隔更新趨勢數據和 ATR 預測
-                if self.current_timestamp == (
-                        (self.current_timestamp // interval_in_sec(self.trend_interval)) * interval_in_sec(self.trend_interval)):
+                # 獲取趨勢數據和 ATR 預測
+                if self.have_data is False:
                     self.trend_candles_df, self.last_trend, self.action_signal = self.get_trend_signal()
-                if self.current_timestamp == (
-                        (self.current_timestamp // interval_in_sec(self.analysis_interval)) * interval_in_sec(self.analysis_interval)):
                     self.analysis_candles_df, self.atr_prediction = self.get_atr_prediction()
-
-            # ========================================== Technical Analysis End ===========================================#
-
-            # ========================================== Order Management Start ===========================================#
-
-            # 檢查止損閾值
-            if self.get_stop_loss():
-                if self.get_have_inventory():
-                    # 如果當前價格低於止損閾值，則賣出所有持倉
-                    self.cancel_all_orders()
-                    self.sell(
-                        connector_name=self.connector_name,
-                        trading_pair=self.market_pair,
-                        amount=self.connectors[self.connector_name].get_balance(self.coin_base),
-                        order_type=OrderType.MARKET,
-                        price=self.current_price
-                    )
-                    self.run_the_bot = False
-            else:
-                # 如果還沒有庫存，則建立庫存
-                if self.get_have_inventory() is not True and self.build_ordered_ts < (self.current_timestamp - self.build_interval):
-                    self.build_inventory()
-                    self.build_ordered_ts = self.current_timestamp
+                    self.have_data = True
                 else:
-                    # 根據 ATR 和當前趨勢設置買入和賣出目標價格
-                    buy_atr_multiplier = self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier
-                    sell_atr_multiplier = self.u_sell_atr_multiplier if self.last_trend else self.d_sell_atr_multiplier
-                    buy_target_price = self.current_price - (self.atr_prediction * buy_atr_multiplier)
-                    sell_target_price = self.current_price + (self.atr_prediction * sell_atr_multiplier)
+                    # 根據指定的時間間隔更新趨勢數據和 ATR 預測
+                    if self.run_instantly(self.trend_interval):
+                        self.trend_candles_df, self.last_trend, self.action_signal = self.get_trend_signal()
+                    if self.run_instantly(self.analysis_interval):
+                        self.analysis_candles_df, self.atr_prediction = self.get_atr_prediction()
 
-                    # 取消所有現有訂單，下新的買入和賣出訂單
-                    if self.mid_price != self.current_price:
+                # ========================================== Technical Analysis End ===========================================#
+
+                # /////////////////////////////////////////////////////////////////////////////////////////////////////////////#
+
+                # ========================================== Order Management Start ===========================================#
+                # 檢查止損閾值
+                if self.get_stop_loss():
+                    if self.get_have_inventory():
+                        # 如果當前價格低於止損閾值，則賣出所有持倉並且停止策略
+                        self.logger().info("Stop loss threshold reached, selling all inventory...")
                         self.cancel_all_orders()
-
-                        buy_order_amount = self.buy_amount(buy_target_price)
-                        sell_order_amount = self.sell_amount()
-
-                        self.buy(
-                            connector_name=self.connector_name,
-                            trading_pair=self.market_pair,
-                            amount=buy_order_amount,
-                            order_type=OrderType.LIMIT,
-                            price=buy_target_price
-                        )
                         self.sell(
                             connector_name=self.connector_name,
                             trading_pair=self.market_pair,
-                            amount=sell_order_amount,
-                            order_type=OrderType.LIMIT,
-                            price=sell_target_price
+                            amount=self.connectors[self.connector_name].get_balance(self.coin_base),
+                            order_type=OrderType.MARKET,
+                            price=self.current_price
                         )
+                        self.run_the_bot = False
+                    else:
+                        # 如果沒有庫存或者庫存太小，停止策略但是要手動檢查
+                        self.logger().info("No inventory or inventory is too small, no need to stop loss...")
+                        self.cancel_all_orders()
+                        self.run_the_bot = False
+                else:
+                    if self.get_have_inventory() is not True:
+                        self.logger().info("No inventory, checking if we can build inventory...")
+                        if self.run_instantly(self.build_interval):
+                            # 庫存價值小於 10, 檢查是否有足夠金額並下單
+                            self.cancel_all_orders()
+                            self.build_inventory()
+                            self.build_ordered_ts = self.current_timestamp
+                    else:
+                        # 根據 ATR 和當前趨勢設置買入和賣出目標價格
+                        buy_atr_multiplier = self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier
+                        sell_atr_multiplier = self.u_sell_atr_multiplier if self.last_trend else self.d_sell_atr_multiplier
+                        buy_target_price = self.current_price - (self.atr_prediction * buy_atr_multiplier)
+                        sell_target_price = self.current_price + (self.atr_prediction * sell_atr_multiplier)
 
-                        self.mid_price = self.current_price
+                        # 取消所有現有訂單，下新的買入和賣出訂單
+                        if self.mid_price != self.current_price:
+                            self.cancel_all_orders()
+
+                            buy_order_amount = self.buy_amount(buy_target_price)
+                            sell_order_amount = self.sell_amount(sell_target_price)
+
+                            self.buy(
+                                connector_name=self.connector_name,
+                                trading_pair=self.market_pair,
+                                amount=buy_order_amount,
+                                order_type=OrderType.LIMIT,
+                                price=buy_target_price
+                            )
+
+                            self.sell(
+                                connector_name=self.connector_name,
+                                trading_pair=self.market_pair,
+                                amount=sell_order_amount,
+                                order_type=OrderType.LIMIT,
+                                price=sell_target_price
+                            )
+
+                            self.mid_price = self.current_price
+            else:
+                # 如果沒有數據，則等待
+                self.logger().info("Waiting for data...")
         else:
-            # 如果沒有數據，則等待
-            self.logger().info("Waiting for data...")
+            # 如果不運行策略，則等待
+            self.logger().info("Bot is not running...")
 
             # ========================================== Order Management End =============================================#
 
-    def on_stop(self):
+    def run_instantly(self, input_interval):
         """
-        Without this functionality, the network iterator will continue running forever after stopping the strategy
-        That's why is necessary to introduce this new feature to make a custom stop with the strategy.
-        :return:
+        Run the bot instantly
         """
-        self.trend_candles.stop()
-        self.analysis_candles.stop()
-
-    def cancel_all_orders(self):
-        """
-        Cancel all orders from the bot
-        """
-        for order in self.get_active_orders(connector_name=self.connector_name):
-            self.cancel(self.connector_name, order.trading_pair, order.client_order_id)
-
-    def buy_amount(self, buy_target_price):
-        # 如果 USDT 餘額大於等於設置的下單金額 'order_usd'，則設置買入數量為 'order_usd / buy_target_price'
-        if self.connectors[self.connector_name].get_balance(self.coin_quote) >= Decimal(self.order_usd):
-            buy_amount = self.order_usd / buy_target_price
-        # 如果 USDT 餘額小於 'order_usd'，但大於等於 'min_order_size'，則設置買入數量為 'connectors[self.connector_name].get_balance(self.coin_quote) / buy_target_price'
-        elif self.min_order_size <= self.connectors[self.connector_name].get_balance(self.coin_quote) < Decimal(
-                self.order_usd):
-            buy_amount = self.connectors[self.connector_name].get_balance(self.coin_quote) / buy_target_price
-        # 如果 USDT 餘額小於 'min_order_size'，則設置買入數量為 0，不進行買入
-        else:
-            buy_amount = Decimal('0.0')
-
-        # 返回買入數量
-        return buy_amount
-
-    def sell_amount(self):
-        # 如果庫存大小（base coin 數量 * 當前價格）大於等於 'min_order_size'，並且小於等於 'order_usd'，則設置賣出數量為庫存大小（base coin 數量）
-        if Decimal(self.min_order_size) <= self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price <= Decimal(self.order_usd):
-            sell_order_amount = self.connectors[self.connector_name].get_balance(self.coin_base)
-        # 如果庫存大小（base coin 數量 * 當前價格）大於 'order_usd'，則設置賣出數量為 'order_usd / 當前價格'
-        elif Decimal(self.order_usd) <= self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price:
-            sell_order_amount = self.order_usd / self.connectors[self.connector_name].get_price(self.market_pair, False)
-        # 如果 USDT 餘額小於等於 'order_usd'，則設置賣出數量為庫存大小（base coin 數量）的一半
-        elif self.connectors[self.connector_name].get_balance(self.coin_quote) <= Decimal(self.order_usd):
-            sell_order_amount = self.connectors[self.connector_name].get_balance(self.coin_base) / Decimal("2")
-        # 如果庫存大小小於 'min_order_size'，則不進行賣出
-        else:
-            sell_order_amount = Decimal('0.0')
-
-        # 返回賣出數量
-        return sell_order_amount
-
-    def build_inventory(self):
-        current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
-        buy_atr_multiplier = self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier
-        buy_target_price = self.current_price - (self.atr_prediction * buy_atr_multiplier)
-
-        # 如果當前庫存價值小於 50，則補足庫存到 50
-        self.buy(
-            connector_name=self.connector_name,
-            trading_pair=self.market_pair,
-            amount=(Decimal('50.0') - current_value) / buy_target_price,
-            order_type=OrderType.LIMIT,
-            price=buy_target_price
-        )
-
-    def get_have_inventory(self):
-        current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
-        # 如果 base coin 價值大於 10，則返回 True，否則返回 False
-        return bool(current_value > Decimal("10"))
-
-    def get_stop_loss(self):
-        # 計算當前賬戶總價值
-        current_value = self.connectors[self.connector_name].get_balance(self.coin_quote) + self.connectors[
-            self.connector_name].get_balance(self.coin_base) * self.current_price
-        # 計算停損價值
-        stop_loss_value = self.total_budget * (Decimal('1') - self.stop_loss)
-
-        # 如果當前價值小於停損價值，則返回 True，否則返回 False
-        return bool(current_value < stop_loss_value)
+        return self.current_timestamp == ((self.current_timestamp // interval_in_sec(input_interval)) * interval_in_sec(input_interval))
 
     def get_trend_signal(self):
         # 獲取趨勢蠟燭圖數據
@@ -397,6 +341,86 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
 
         # 返回分析蠟燭圖數據和 ATR
         return analysis_candles_df, atr_pred
+
+    def on_stop(self):
+        """
+        Without this functionality, the network iterator will continue running forever after stopping the strategy
+        That's why is necessary to introduce this new feature to make a custom stop with the strategy.
+        :return:
+        """
+        self.trend_candles.stop()
+        self.analysis_candles.stop()
+
+    def cancel_all_orders(self):
+        """
+        Cancel all orders from the bot
+        """
+        for order in self.get_active_orders(connector_name=self.connector_name):
+            self.cancel(self.connector_name, order.trading_pair, order.client_order_id)
+
+    def get_have_inventory(self):
+        current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
+        # 如果 base coin 價值大於 10，則返回 True，否則返回 False
+        return bool(current_value > Decimal("10"))
+
+    def get_stop_loss(self):
+        # 計算當前賬戶總價值
+        current_value = self.connectors[self.connector_name].get_balance(self.coin_quote) + self.connectors[
+            self.connector_name].get_balance(self.coin_base) * self.current_price
+        # 計算停損價值
+        stop_loss_value = self.total_budget * (Decimal('1') - self.stop_loss)
+
+        # 如果當前價值小於停損價值，則返回 True，否則返回 False
+        return bool(current_value < stop_loss_value)
+
+    def build_inventory(self):
+        current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
+        buy_atr_multiplier = self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier
+        buy_target_price = self.current_price - (self.atr_prediction * buy_atr_multiplier)
+        usd_balance = self.connectors[self.connector_name].get_balance(self.coin_quote)
+        if usd_balance >= Decimal(self.order_usd):
+            # 如果當前庫存價值小於 order_usd，則補足庫存到 order_usd
+            self.buy(
+                connector_name=self.connector_name,
+                trading_pair=self.market_pair,
+                amount=(Decimal(self.order_usd) - current_value) / buy_target_price,
+                order_type=OrderType.LIMIT,
+                price=buy_target_price
+            )
+        else:
+            # 穩定幣不足，不進行買入
+            self.logger().info(f"Insufficient {self.coin_quote} balance to buy {self.coin_base}")
+
+    def buy_amount(self, buy_target_price):
+        current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
+        # 如果 USDT 餘額大於等於設置的下單金額 'order_usd'，則設置買入數量為 'order_usd / buy_target_price'
+        if self.connectors[self.connector_name].get_balance(self.coin_quote) >= Decimal(self.order_usd):
+            buy_amount = self.order_usd / buy_target_price
+        # 如果 USDT 餘額小於 'order_usd'，但大於等於 'min_order_size'，則設置買入數量為 'connectors[self.connector_name].get_balance(self.coin_quote) / buy_target_price'
+        elif self.min_order_size <= self.connectors[self.connector_name].get_balance(self.coin_quote) < Decimal(
+                self.order_usd):
+            buy_amount = (Decimal(self.order_usd) - current_value) / buy_target_price
+        # 如果 USDT 餘額小於 'min_order_size'，則設置買入數量為 0，不進行買入
+        else:
+            buy_amount = Decimal('0.0')
+
+        # 返回買入數量
+        return buy_amount
+
+    def sell_amount(self, sell_target_price):
+        current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
+        # 如果庫存大小（base coin 數量 * 當前價格）大於等於 'min_order_size'，並且小於等於 'order_usd'，則設置賣出數量為庫存大小（base coin 數量）
+        if Decimal(self.min_order_size) <= current_value <= Decimal(self.order_usd):
+            sell_order_amount = self.connectors[self.connector_name].get_balance(self.coin_base)
+        # 如果庫存價值大於 'order_usd'，則設置賣出數量為 'order_usd / 預測價格'
+        elif Decimal(self.order_usd) <= current_value:
+            sell_order_amount = self.order_usd / sell_target_price
+        # 如果庫存大小小於 'min_order_size'，則不進行賣出
+        else:
+            sell_order_amount = Decimal('0.0')
+
+        # 返回賣出數量
+        return sell_order_amount
 
     def did_create_buy_order(self, event: BuyOrderCreatedEvent):
         """
