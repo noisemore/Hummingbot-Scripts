@@ -1,7 +1,7 @@
 import logging
 from decimal import Decimal
 from typing import Dict
-import math
+import time
 
 import pandas as pd
 import pandas_ta as ta  # noqa: F401
@@ -98,10 +98,12 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
     min_order_size = Decimal("10.0")  # 最小交易量
     stop_loss = Decimal('0.1')  # 止損閾值
 
-    u_buy_atr_multiplier = Decimal("2")  # 上漲時買入的ATR倍數
-    u_sell_atr_multiplier = Decimal("2.5")  # 上漲時賣出的ATR倍數
-    d_buy_atr_multiplier = Decimal("2.5")  # 下跌時買入的ATR倍數
-    d_sell_atr_multiplier = Decimal("2")  # 下跌時賣出的ATR倍數
+    u_buy_atr_multiplier = Decimal("2.382")  # 上漲時買入的ATR倍數
+    u_sell_atr_multiplier = Decimal("2.618")  # 上漲時賣出的ATR倍數
+    d_buy_atr_multiplier = Decimal("2.618")  # 下跌時買入的ATR倍數
+    d_sell_atr_multiplier = Decimal("2.382")  # 下跌時賣出的ATR倍數
+    closest_order_percentage = Decimal("0.003")  # 最小訂單比例
+    farthest_order_percentage = Decimal("0.015")  # 最大訂單比例
 
     run_the_bot = bool(True)  # 是否運行機器人策略
 
@@ -168,7 +170,9 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
                         self.run_the_bot = False
                 else:
                     if self.get_have_inventory() is not True:
-                        self.logger().info("No inventory, checking if we can build inventory...")
+                        if len(self.get_active_orders(connector_name=self.connector_name)) == 0:
+                            # 有下單就不要叫叫叫
+                            self.logger().info("No inventory, checking if we can build inventory...")
                         if self.run_instantly(self.build_interval):
                             # 庫存價值小於 10, 檢查是否有足夠金額並下單
                             self.cancel_all_orders()
@@ -178,8 +182,31 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
                         # 根據 ATR 和當前趨勢設置買入和賣出目標價格
                         buy_atr_multiplier = self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier
                         sell_atr_multiplier = self.u_sell_atr_multiplier if self.last_trend else self.d_sell_atr_multiplier
-                        buy_target_price = self.current_price - (self.atr_prediction * buy_atr_multiplier)
-                        sell_target_price = self.current_price + (self.atr_prediction * sell_atr_multiplier)
+
+                        # 计算最小和最大买入价格和卖出价格
+                        closest_buy_price = self.current_price * (Decimal('1') - self.closest_order_percentage)
+                        farthest_buy_price = self.current_price * (Decimal('1') - self.farthest_order_percentage)
+                        closest_sell_price = self.current_price * (Decimal('1') + self.closest_order_percentage)
+                        farthest_sell_price = self.current_price * (Decimal('1') + self.farthest_order_percentage)
+
+                        # 根据 ATR 预测和乘数计算预测的买入和卖出目标价格
+                        predict_buy_target_price = self.current_price - (self.atr_prediction * buy_atr_multiplier)
+                        predict_sell_target_price = self.current_price + (self.atr_prediction * sell_atr_multiplier)
+
+                        # 根据最小和最大买入价格和卖出价格设置买入和卖出目标价格
+                        if predict_buy_target_price >= closest_buy_price:
+                            buy_target_price = closest_buy_price
+                        elif predict_buy_target_price <= farthest_buy_price:
+                            buy_target_price = farthest_buy_price
+                        else:
+                            buy_target_price = predict_buy_target_price
+
+                        if predict_sell_target_price < closest_sell_price:
+                            sell_target_price = closest_sell_price
+                        elif predict_sell_target_price > farthest_sell_price:
+                            sell_target_price = farthest_sell_price
+                        else:
+                            sell_target_price = predict_sell_target_price
 
                         # 取消所有現有訂單，下新的買入和賣出訂單
                         if self.mid_price != self.current_price:
@@ -505,8 +532,7 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
             lines.extend(["", "Active Orders:"])
             try:
                 active_order = self.active_orders_df().drop('Exchange', axis=1)
-                active_order['Price_diff %'] = (
-                    abs(active_order['Price'] - float(self.current_price) / float(self.current_price)))
+                active_order['Price_diff %'] = abs(active_order['Price'] - float(self.current_price)) / float(self.current_price) * float(100)
                 lines.extend(["" + line for line in active_order.to_string(index=False).split("\n")])
             except ValueError:
                 lines.extend(["", "No active maker orders."])
