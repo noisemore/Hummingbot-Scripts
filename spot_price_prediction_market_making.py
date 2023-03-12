@@ -1,6 +1,7 @@
 import logging
 from decimal import Decimal
 from typing import Dict
+import math
 
 import pandas as pd
 import pandas_ta as ta  # noqa: F401
@@ -121,7 +122,8 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
 
     def on_tick(self):
 
-        if self.run_the_bot is True:
+        if self.run_the_bot is True and self.all_candles_ready is True:
+            # 已蒐集到足夠的數據，可以開始進行策略運行
 
             # ========================================== Technical Analysis Start =========================================#
 
@@ -191,6 +193,9 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
                         )
 
                         self.mid_price = self.current_price
+        else:
+            # 如果沒有數據，則等待
+            self.logger().info("Waiting for data...")
 
             # ========================================== Order Management End =============================================#
 
@@ -243,19 +248,17 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
         return sell_order_amount
 
     def build_inventory(self):
-        """
-        Build inventory
-        """
-        # 如果 base coin 數量小於等於 0.1，則下一個買入單購買 50 美元的加密貨幣
-        if self.connectors[self.connector_name].get_balance(self.coin_base) <= Decimal("0.1"):
+        current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
+        # 如果 base coin 價值小於等於 10，則下一個買入單購買 50 美元的加密貨幣
+        if current_value <= Decimal("10"):
             self.buy(
                 connector_name=self.connector_name,
                 trading_pair=self.market_pair,
                 amount=Decimal('50.0') / self.connectors[self.connector_name].get_price(self.market_pair, True),
                 order_type=OrderType.LIMIT,
-                price=self.connectors[self.connector_name].get_price(self.market_pair, True)
+                price=self.current_price - (self.atr_prediction * (self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier))
             )
-        # 如果 base coin 數量大於 0.1，則下一個買入單購買使賬戶中 USDT 餘額達到 50 美元的加密貨幣
+        # 如果 base coin 價值大於 10，則下一個買入單購買使賬戶中 USDT 餘額達到 50 美元的加密貨幣
         else:
             self.buy(
                 connector_name=self.connector_name,
@@ -266,8 +269,9 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
             )
 
     def get_have_inventory(self):
-        # 如果 base coin 數量大於 0，則返回 True，否則返回 False
-        return bool(self.connectors[self.connector_name].get_balance(self.coin_base) > Decimal("0"))
+        current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
+        # 如果 base coin 價值大於 10，則返回 True，否則返回 False
+        return bool(current_value > Decimal("10"))
 
     def get_stop_loss(self):
         # 計算當前賬戶總價值
