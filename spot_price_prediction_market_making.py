@@ -249,24 +249,17 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
 
     def build_inventory(self):
         current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
-        # 如果 base coin 價值小於等於 10，則下一個買入單購買 50 美元的加密貨幣
-        if current_value <= Decimal("10"):
-            self.buy(
-                connector_name=self.connector_name,
-                trading_pair=self.market_pair,
-                amount=Decimal('50.0') / self.connectors[self.connector_name].get_price(self.market_pair, True),
-                order_type=OrderType.LIMIT,
-                price=self.current_price - (self.atr_prediction * (self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier))
-            )
-        # 如果 base coin 價值大於 10，則下一個買入單購買使賬戶中 USDT 餘額達到 50 美元的加密貨幣
-        else:
-            self.buy(
-                connector_name=self.connector_name,
-                trading_pair=self.market_pair,
-                amount=(Decimal('50.0') - self.connectors[self.connector_name].get_balance(self.coin_quote)) / self.connectors[self.connector_name].get_price(self.market_pair, True),
-                order_type=OrderType.LIMIT,
-                price=self.connectors[self.connector_name].get_price(self.market_pair, True)
-            )
+        buy_atr_multiplier = self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier
+        buy_target_price = self.current_price - (self.atr_prediction * buy_atr_multiplier)
+
+        # 如果當前庫存價值小於 50，則補足庫存到 50
+        self.buy(
+            connector_name=self.connector_name,
+            trading_pair=self.market_pair,
+            amount=(Decimal('50.0') - current_value) / buy_target_price,
+            order_type=OrderType.LIMIT,
+            price=buy_target_price
+        )
 
     def get_have_inventory(self):
         current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
