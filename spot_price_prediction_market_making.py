@@ -2,6 +2,7 @@ import logging
 from decimal import Decimal
 from typing import Dict
 import time
+from typing import List
 
 import pandas as pd
 import pandas_ta as ta  # noqa: F401
@@ -10,6 +11,8 @@ from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
 
 from hummingbot.connector.utils import split_hb_trading_pair
+from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     BuyOrderCreatedEvent,
@@ -88,9 +91,7 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
     atr_prediction = Decimal("0.00")  # 預測的平均真實範圍
     analysis_candles_df = pd.DataFrame()  # 儲存進行價格預測的K線數據
 
-    build_ordered_ts = int(0)  # 最近一次建立庫存的時間戳
     build_interval = str("30s")  # 建立庫存的時間間隔
-    have_inventory = bool(False)  # 是否已經建立庫存
 
     mid_price = Decimal("0.00")  # 市場的中間價格
     total_budget = Decimal("100")  # 總預算
@@ -98,12 +99,15 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
     min_order_size = Decimal("10.0")  # 最小交易量
     stop_loss = Decimal('0.1')  # 止損閾值
 
-    u_buy_atr_multiplier = Decimal("2.382")  # 上漲時買入的ATR倍數
-    u_sell_atr_multiplier = Decimal("2.618")  # 上漲時賣出的ATR倍數
-    d_buy_atr_multiplier = Decimal("2.618")  # 下跌時買入的ATR倍數
-    d_sell_atr_multiplier = Decimal("2.382")  # 下跌時賣出的ATR倍數
+    u_buy_atr_multiplier = Decimal("2")  # 上漲時買入的ATR倍數
+    u_sell_atr_multiplier = Decimal("2.5")  # 上漲時賣出的ATR倍數
+    d_buy_atr_multiplier = Decimal("2.5")  # 下跌時買入的ATR倍數
+    d_sell_atr_multiplier = Decimal("2")  # 下跌時賣出的ATR倍數
     closest_order_percentage = Decimal("0.003")  # 最小訂單比例
     farthest_order_percentage = Decimal("0.015")  # 最大訂單比例
+
+    last_ordered_ts = int(0)
+    order_interval = int(5)
 
     run_the_bot = bool(True)  # 是否運行機器人策略
 
@@ -127,13 +131,13 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
 
     def on_tick(self):
 
-        if self.run_the_bot is True:
-            if self.all_candles_ready is True:
+        if self.run_the_bot:
+            if self.all_candles_ready:
                 # 已蒐集到足夠的數據，可以開始進行策略運行
                 # ========================================== Technical Analysis Start =========================================#
 
                 # 獲取趨勢數據和 ATR 預測
-                if self.have_data is False:
+                if not self.have_data:
                     self.trend_candles_df, self.last_trend, self.action_signal = self.get_trend_signal()
                     self.analysis_candles_df, self.atr_prediction = self.get_atr_prediction()
                     self.have_data = True
@@ -149,9 +153,12 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
                 # /////////////////////////////////////////////////////////////////////////////////////////////////////////////#
 
                 # ========================================== Order Management Start ===========================================#
+                # 檢查是否有足夠庫存及資金
+                base_checker, quote_checker = self.inventory_checker()
+
                 # 檢查止損閾值
                 if self.get_stop_loss():
-                    if self.get_have_inventory():
+                    if base_checker:
                         # 如果當前價格低於止損閾值，則賣出所有持倉並且停止策略
                         self.logger().info("Stop loss threshold reached, selling all inventory...")
                         self.cancel_all_orders()
@@ -169,7 +176,7 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
                         self.cancel_all_orders()
                         self.run_the_bot = False
                 else:
-                    if self.get_have_inventory() is not True:
+                    if not base_checker:
                         if len(self.get_active_orders(connector_name=self.connector_name)) == 0:
                             # 有下單就不要叫叫叫
                             self.logger().info("No inventory, checking if we can build inventory...")
@@ -177,61 +184,69 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
                             # 庫存價值小於 10, 檢查是否有足夠金額並下單
                             self.cancel_all_orders()
                             self.build_inventory()
-                            self.build_ordered_ts = self.current_timestamp
-                    else:
-                        # 根據 ATR 和當前趨勢設置買入和賣出目標價格
-                        buy_atr_multiplier = self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier
-                        sell_atr_multiplier = self.u_sell_atr_multiplier if self.last_trend else self.d_sell_atr_multiplier
-
-                        # 计算最小和最大买入价格和卖出价格
-                        closest_buy_price = self.current_price * (Decimal('1') - self.closest_order_percentage)
-                        farthest_buy_price = self.current_price * (Decimal('1') - self.farthest_order_percentage)
-                        closest_sell_price = self.current_price * (Decimal('1') + self.closest_order_percentage)
-                        farthest_sell_price = self.current_price * (Decimal('1') + self.farthest_order_percentage)
-
-                        # 根据 ATR 预测和乘数计算预测的买入和卖出目标价格
-                        predict_buy_target_price = self.current_price - (self.atr_prediction * buy_atr_multiplier)
-                        predict_sell_target_price = self.current_price + (self.atr_prediction * sell_atr_multiplier)
-
-                        # 根据最小和最大买入价格和卖出价格设置买入和卖出目标价格
-                        if predict_buy_target_price >= closest_buy_price:
-                            buy_target_price = closest_buy_price
-                        elif predict_buy_target_price <= farthest_buy_price:
-                            buy_target_price = farthest_buy_price
-                        else:
-                            buy_target_price = predict_buy_target_price
-
-                        if predict_sell_target_price < closest_sell_price:
-                            sell_target_price = closest_sell_price
-                        elif predict_sell_target_price > farthest_sell_price:
-                            sell_target_price = farthest_sell_price
-                        else:
-                            sell_target_price = predict_sell_target_price
-
-                        # 取消所有現有訂單，下新的買入和賣出訂單
-                        if self.mid_price != self.current_price:
+                    elif not quote_checker:
+                        if len(self.get_active_orders(connector_name=self.connector_name)) == 0:
+                            # 有下單就不要叫叫叫
+                            self.logger().info("No money, checking if we can sell inventory...")
+                        if self.run_instantly(self.build_interval):
+                            # 穩定幣價值小於 10, 檢查是否有足夠庫存並下單
                             self.cancel_all_orders()
+                            self.get_money()
+                    else:
+                        # 中間價有變動就下單或者時間到就下單
+                        if self.mid_price != self.current_price or self.last_ordered_ts < (self.current_timestamp - self.order_interval):
+                            self.cancel_all_orders()
+
+                            # 根據 ATR 和當前趨勢設置買入和賣出目標價格
+                            buy_atr_multiplier = self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier
+                            sell_atr_multiplier = self.u_sell_atr_multiplier if self.last_trend else self.d_sell_atr_multiplier
+
+                            # 计算最小和最大买入价格和卖出价格
+                            closest_buy_price = self.current_price * (Decimal('1') - self.closest_order_percentage)
+                            farthest_buy_price = self.current_price * (Decimal('1') - self.farthest_order_percentage)
+                            closest_sell_price = self.current_price * (Decimal('1') + self.closest_order_percentage)
+                            farthest_sell_price = self.current_price * (Decimal('1') + self.farthest_order_percentage)
+
+                            # 根据 ATR 预测和乘数计算预测的买入和卖出目标价格
+                            predict_buy_target_price = self.current_price - (self.atr_prediction * buy_atr_multiplier)
+                            predict_sell_target_price = self.current_price + (self.atr_prediction * sell_atr_multiplier)
+
+                            # 根据最小和最大买入价格和卖出价格设置买入和卖出目标价格
+                            if predict_buy_target_price >= closest_buy_price:
+                                buy_target_price = closest_buy_price
+                            elif predict_buy_target_price <= farthest_buy_price:
+                                buy_target_price = farthest_buy_price
+                            else:
+                                buy_target_price = predict_buy_target_price
+
+                            if predict_sell_target_price < closest_sell_price:
+                                sell_target_price = closest_sell_price
+                            elif predict_sell_target_price > farthest_sell_price:
+                                sell_target_price = farthest_sell_price
+                            else:
+                                sell_target_price = predict_sell_target_price
 
                             buy_order_amount = self.buy_amount(buy_target_price)
                             sell_order_amount = self.sell_amount(sell_target_price)
 
-                            self.buy(
-                                connector_name=self.connector_name,
-                                trading_pair=self.market_pair,
-                                amount=buy_order_amount,
-                                order_type=OrderType.LIMIT,
-                                price=buy_target_price
-                            )
+                            buy_order = OrderCandidate(trading_pair=self.market_pair, is_maker=True,
+                                                       order_type=OrderType.LIMIT,
+                                                       order_side=TradeType.BUY, amount=buy_order_amount,
+                                                       price=buy_target_price)
 
-                            self.sell(
-                                connector_name=self.connector_name,
-                                trading_pair=self.market_pair,
-                                amount=sell_order_amount,
-                                order_type=OrderType.LIMIT,
-                                price=sell_target_price
-                            )
+                            sell_order = OrderCandidate(trading_pair=self.market_pair, is_maker=True,
+                                                        order_type=OrderType.LIMIT,
+                                                        order_side=TradeType.SELL, amount=sell_order_amount,
+                                                        price=sell_target_price)
+
+                            orders = [buy_order, sell_order]
+
+                            proposal: List[OrderCandidate] = orders
+                            proposal_adjusted: List[OrderCandidate] = self.adjust_proposal_to_budget(proposal)
+                            self.place_orders(proposal_adjusted)
 
                             self.mid_price = self.current_price
+                            self.last_ordered_ts = self.current_timestamp
             else:
                 # 如果沒有數據，則等待
                 self.logger().info("Waiting for data...")
@@ -385,10 +400,13 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
         for order in self.get_active_orders(connector_name=self.connector_name):
             self.cancel(self.connector_name, order.trading_pair, order.client_order_id)
 
-    def get_have_inventory(self):
+    def inventory_checker(self):
         current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
-        # 如果 base coin 價值大於 10，則返回 True，否則返回 False
-        return bool(current_value > Decimal("10"))
+        # 檢查當前賬戶中的 base價值是否大於 10
+        base_checker = bool(current_value > Decimal("10"))
+        # 檢查當前賬戶中的 quote價值是否大於 10
+        quote_checker = bool(self.connectors[self.connector_name].get_balance(self.coin_quote) > Decimal("10"))
+        return base_checker, quote_checker
 
     def get_stop_loss(self):
         # 計算當前賬戶總價值
@@ -402,31 +420,48 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
 
     def build_inventory(self):
         current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
-        buy_atr_multiplier = self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier
-        buy_target_price = self.current_price - (self.atr_prediction * buy_atr_multiplier)
         usd_balance = self.connectors[self.connector_name].get_balance(self.coin_quote)
         if usd_balance >= Decimal(self.order_usd):
             # 如果當前庫存價值小於 order_usd，則補足庫存到 order_usd
             self.buy(
                 connector_name=self.connector_name,
                 trading_pair=self.market_pair,
-                amount=(Decimal(self.order_usd) - current_value) / buy_target_price,
+                amount=(Decimal(self.order_usd) - current_value) / self.connectors[self.connector_name].get_price(
+                    self.market_pair, True),
                 order_type=OrderType.LIMIT,
-                price=buy_target_price
+                price=self.connectors[self.connector_name].get_price(
+                    self.market_pair, True)
             )
         else:
             # 穩定幣不足，不進行買入
             self.logger().info(f"Insufficient {self.coin_quote} balance to buy {self.coin_base}")
 
-    def buy_amount(self, buy_target_price):
+    def get_money(self):
         current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
+        buy_atr_multiplier = self.u_buy_atr_multiplier if self.last_trend else self.d_buy_atr_multiplier
+        if current_value >= Decimal(self.order_usd):
+            # 如果當前庫存價值大於 order_usd，則賣出庫存到 order_usd
+            self.sell(
+                connector_name=self.connector_name,
+                trading_pair=self.market_pair,
+                amount=(current_value - Decimal(self.order_usd)) / self.connectors[self.connector_name].get_price(
+                    self.market_pair, False),
+                order_type=OrderType.LIMIT,
+                price=self.connectors[self.connector_name].get_price(self.market_pair, False)
+            )
+        else:
+            # 庫存不足，不進行賣出
+            self.logger().info(f"Insufficient {self.coin_base} balance to sell {self.coin_quote}")
+
+    def buy_amount(self, buy_target_price):
+        quote_balance = self.connectors[self.connector_name].get_balance(self.coin_quote)
+        base_balance = self.connectors[self.connector_name].get_balance(self.coin_base)
         # 如果 USDT 餘額大於等於設置的下單金額 'order_usd'，則設置買入數量為 'order_usd / buy_target_price'
-        if self.connectors[self.connector_name].get_balance(self.coin_quote) >= Decimal(self.order_usd):
+        if quote_balance >= Decimal(self.order_usd):
             buy_amount = self.order_usd / buy_target_price
         # 如果 USDT 餘額小於 'order_usd'，但大於等於 'min_order_size'，則設置買入數量為 'connectors[self.connector_name].get_balance(self.coin_quote) / buy_target_price'
-        elif self.min_order_size <= self.connectors[self.connector_name].get_balance(self.coin_quote) < Decimal(
-                self.order_usd):
-            buy_amount = (Decimal(self.order_usd) - current_value) / buy_target_price
+        elif self.min_order_size <= quote_balance < Decimal(self.order_usd):
+            buy_amount = (Decimal(self.order_usd) - (base_balance * self.current_price)) / buy_target_price
         # 如果 USDT 餘額小於 'min_order_size'，則設置買入數量為 0，不進行買入
         else:
             buy_amount = Decimal('0.0')
@@ -435,12 +470,13 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
         return buy_amount
 
     def sell_amount(self, sell_target_price):
-        current_value = self.connectors[self.connector_name].get_balance(self.coin_base) * self.current_price
+        base_balance = self.connectors[self.connector_name].get_balance(self.coin_base)
+        current_value = base_balance * self.current_price
         # 如果庫存大小（base coin 數量 * 當前價格）大於等於 'min_order_size'，並且小於等於 'order_usd'，則設置賣出數量為庫存大小（base coin 數量）
-        if Decimal(self.min_order_size) <= current_value <= Decimal(self.order_usd):
-            sell_order_amount = self.connectors[self.connector_name].get_balance(self.coin_base)
+        if Decimal(self.min_order_size) < current_value <= Decimal(self.order_usd):
+            sell_order_amount = base_balance
         # 如果庫存價值大於 'order_usd'，則設置賣出數量為 'order_usd / 預測價格'
-        elif Decimal(self.order_usd) <= current_value:
+        elif Decimal(self.order_usd) < current_value:
             sell_order_amount = self.order_usd / sell_target_price
         # 如果庫存大小小於 'min_order_size'，則不進行賣出
         else:
@@ -448,6 +484,22 @@ class spot_price_prediction_market_making(ScriptStrategyBase):
 
         # 返回賣出數量
         return sell_order_amount
+
+    def adjust_proposal_to_budget(self, proposal: List[OrderCandidate]) -> List[OrderCandidate]:
+        proposal_adjusted = self.connectors[self.connector_name].budget_checker.adjust_candidates(proposal, all_or_none=True)
+        return proposal_adjusted
+
+    def place_orders(self, proposal: List[OrderCandidate]) -> None:
+        for order in proposal:
+            self.place_order(connector_name=self.connector_name, order=order)
+
+    def place_order(self, connector_name: str, order: OrderCandidate):
+        if order.order_side == TradeType.SELL:
+            self.sell(connector_name=connector_name, trading_pair=order.trading_pair, amount=order.amount,
+                      order_type=order.order_type, price=order.price)
+        elif order.order_side == TradeType.BUY:
+            self.buy(connector_name=connector_name, trading_pair=order.trading_pair, amount=order.amount,
+                     order_type=order.order_type, price=order.price)
 
     def did_create_buy_order(self, event: BuyOrderCreatedEvent):
         """
